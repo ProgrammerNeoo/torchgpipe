@@ -1,4 +1,5 @@
 """ResNet-101 Speed Benchmark"""
+import os
 import platform
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
@@ -8,6 +9,10 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.optim import SGD
+
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from resnet import resnet101
 import torchgpipe
@@ -111,49 +116,32 @@ def parse_devices(ctx: Any, param: Any, value: Optional[str]) -> List[int]:
     return [int(x) for x in value.split(',')]
 
 
-@click.command()
-@click.pass_context
-@click.argument(
-    'experiment',
-    type=click.Choice(sorted(EXPERIMENTS.keys())),
-)
-@click.option(
-    '--epochs', '-e',
-    type=int,
-    default=10,
-    help='Number of epochs (default: 10)',
-)
-@click.option(
-    '--skip-epochs', '-k',
-    type=int,
-    default=1,
-    help='Number of epochs to skip in result (default: 1)',
-)
-@click.option(
-    '--devices', '-d',
-    metavar='0,1,2,3',
-    callback=parse_devices,
-    help='Device IDs to use (default: all CUDA devices)',
-)
-def cli(ctx: click.Context,
-        experiment: str,
-        epochs: int,
-        skip_epochs: int,
-        devices: List[int],
-        ) -> None:
-    """ResNet-101 Speed Benchmark"""
-    if skip_epochs >= epochs:
-        ctx.fail('--skip-epochs=%d must be less than --epochs=%d' % (skip_epochs, epochs))
+def data_parallel_train(rank, world_size, experiment, devices, epochs, skip_epochs):
+    """Train ResNet-101 with data parallelism"""
+    # initialize environment
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group('nccl', rank=rank, world_size=world_size)
 
     model: nn.Module = resnet101(num_classes=1000)
 
+    if len(devices) % world_size != 0:
+        raise ValueError('GPUs cannot be divided evenly into %d pipelines' % (world_size))
+    num_devices_per_pipeline = len(devices) // world_size
+    # Get the set of GPUs to be used for this pipeline
+    devices_pipeline = devices[rank * num_devices_per_pipeline: (rank+1) * num_devices_per_pipeline]
+
+    # Pipeline parallelism
     f = EXPERIMENTS[experiment]
     try:
-        model, batch_size, _devices = f(model, devices)
+        model, batch_size, _devices = f(model, devices_pipeline)
     except ValueError as exc:
         # Examples:
         #   ValueError: too few devices to hold given partitions (devices: 1, paritions: 2)
-        ctx.fail(str(exc))
+        raise
+
+    # Data parallelism
+    model = DDP(model)
 
     optimizer = SGD(model.parameters(), lr=0.1)
 
@@ -178,29 +166,40 @@ def cli(ctx: click.Context,
     # HEADER ======================================================================================
 
     title = f'{experiment}, {skip_epochs+1}-{epochs} epochs'
-    click.echo(title)
 
-    if isinstance(model, GPipe):
-        click.echo(f'batch size: {batch_size}, chunks: {model.chunks}, balance: {model.balance}')
-    else:
-        click.echo(f'batch size: {batch_size}')
+    if rank == 0:
+        # Only print the header on data-parallel rank 0
+        click.echo(title)
 
-    click.echo('torchgpipe: %s, python: %s, torch: %s, cudnn: %s, cuda: %s, gpu: %s' % (
-        torchgpipe.__version__,
-        platform.python_version(),
-        torch.__version__,
-        torch.backends.cudnn.version(),
-        torch.version.cuda,
-        torch.cuda.get_device_name(in_device)))
+        if isinstance(model, GPipe):
+            click.echo(f'batch size: {batch_size}, chunks: {model.chunks}, balance: {model.balance}')
+        else:
+            click.echo(f'batch size: {batch_size}')
+
+        click.echo('torchgpipe: %s, python: %s, torch: %s, cudnn: %s, cuda: %s, gpu: %s' % (
+            torchgpipe.__version__,
+            platform.python_version(),
+            torch.__version__,
+            torch.backends.cudnn.version(),
+            torch.version.cuda,
+            torch.cuda.get_device_name(in_device)))
 
     # TRAIN =======================================================================================
 
-    global BASE_TIME
-    BASE_TIME = time.time()
+    if rank == 0:
+        global BASE_TIME
+        BASE_TIME = time.time()
 
-    def run_epoch(epoch: int) -> Tuple[float, float]:
+        throughputs = []
+        elapsed_times = []
+
+        hr()
+
+    for epoch in range(epochs):
         torch.cuda.synchronize(in_device)
-        tick = time.time()
+
+        if rank == 0:
+            tick = time.time()
 
         data_trained = 0
         for i, (input, target) in enumerate(data):
@@ -213,45 +212,85 @@ def cli(ctx: click.Context,
             optimizer.step()
             optimizer.zero_grad()
 
-            # 00:01:02 | 1/20 epoch (42%) | 200.000 samples/sec (estimated)
-            percent = (i+1) / len(data) * 100
-            throughput = data_trained / (time.time()-tick)
-            log('%d/%d epoch (%d%%) | %.3f samples/sec (estimated)'
-                '' % (epoch+1, epochs, percent, throughput), clear=True, nl=False)
+            if rank == 0:
+                # 00:01:02 | 1/20 epoch (42%) | 200.000 samples/sec (estimated)
+                percent = (i+1) / len(data) * 100
+                throughput = data_trained / (time.time()-tick)
+                log('%d/%d epoch (%d%%) | %.3f samples/sec (estimated)'
+                    '' % (epoch+1, epochs, percent, throughput), clear=True, nl=False)
 
         torch.cuda.synchronize(in_device)
-        tock = time.time()
 
-        # 00:02:03 | 1/20 epoch | 200.000 samples/sec, 123.456 sec/epoch
-        elapsed_time = tock - tick
-        throughput = dataset_size / elapsed_time
-        log('%d/%d epoch | %.3f samples/sec, %.3f sec/epoch'
-            '' % (epoch+1, epochs, throughput, elapsed_time), clear=True)
-
-        return throughput, elapsed_time
-
-    throughputs = []
-    elapsed_times = []
-
-    hr()
-    for epoch in range(epochs):
-        throughput, elapsed_time = run_epoch(epoch)
+        if rank == 0:
+            tock = time.time()
+            
+            # 00:02:03 | 1/20 epoch | 200.000 samples/sec, 123.456 sec/epoch
+            elapsed_time = tock - tick
+            throughput = dataset_size / elapsed_time
+            log('%d/%d epoch | %.3f samples/sec, %.3f sec/epoch'
+                '' % (epoch+1, epochs, throughput, elapsed_time), clear=True)
+            
+            throughputs.append(throughput)
+            elapsed_times.append(elapsed_time)
 
         if epoch < skip_epochs:
             continue
 
-        throughputs.append(throughput)
-        elapsed_times.append(elapsed_time)
-    hr()
-
     # RESULT ======================================================================================
+    if rank == 0:
+        hr()
+    
+        # pipeline-4, 2-10 epochs | 200.000 samples/sec, 123.456 sec/epoch (average)
+        n = len(throughputs)
+        throughput = sum(throughputs) / n
+        elapsed_time = sum(elapsed_times) / n
+        click.echo('%s | %.3f samples/sec, %.3f sec/epoch (average)'
+                '' % (title, throughput, elapsed_time))
 
-    # pipeline-4, 2-10 epochs | 200.000 samples/sec, 123.456 sec/epoch (average)
-    n = len(throughputs)
-    throughput = sum(throughputs) / n
-    elapsed_time = sum(elapsed_times) / n
-    click.echo('%s | %.3f samples/sec, %.3f sec/epoch (average)'
-               '' % (title, throughput, elapsed_time))
+
+@click.command()
+@click.pass_context
+@click.argument(
+    'experiment',
+    type=click.Choice(sorted(EXPERIMENTS.keys())),
+)
+@click.option(
+    '--dp_world_size', '-p',
+    type=int,
+    default=1,
+    help='World size of data parallelism (default: 1)',
+)
+@click.option(
+    '--epochs', '-e',
+    type=int,
+    default=10,
+    help='Number of epochs (default: 10)',
+)
+@click.option(
+    '--skip-epochs', '-k',
+    type=int,
+    default=1,
+    help='Number of epochs to skip in result (default: 1)',
+)
+@click.option(
+    '--devices', '-d',
+    metavar='0,1,2,3',
+    callback=parse_devices,
+    help='Device IDs to use (default: all CUDA devices)',
+)
+def cli(ctx: click.Context,
+        experiment: str,
+        dp_world_size: int,
+        epochs: int,
+        skip_epochs: int,
+        devices: List[int],
+        ) -> None:
+    """ResNet-101 Speed Benchmark"""
+    if skip_epochs >= epochs:
+        ctx.fail('--skip-epochs=%d must be less than --epochs=%d' % (skip_epochs, epochs))
+
+    mp.spawn(data_parallel_train, args=(dp_world_size, experiment, devices, epochs, skip_epochs), 
+            nprocs=dp_world_size, join=True)
 
 
 if __name__ == '__main__':
