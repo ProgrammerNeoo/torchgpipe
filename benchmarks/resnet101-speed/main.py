@@ -116,7 +116,7 @@ def parse_devices(ctx: Any, param: Any, value: Optional[str]) -> List[int]:
     return [int(x) for x in value.split(',')]
 
 
-def data_parallel_train(rank, world_size, experiment, devices, epochs, skip_epochs):
+def data_parallel_train(rank, world_size, experiment, devices, epochs):
     """Train ResNet-101 with data parallelism"""
     # initialize environment
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -165,7 +165,7 @@ def data_parallel_train(rank, world_size, experiment, devices, epochs, skip_epoc
 
     # HEADER ======================================================================================
 
-    title = f'{experiment}, {skip_epochs+1}-{epochs} epochs'
+    title = f'{experiment}, {epochs} epochs'
 
     if rank == 0:
         # Only print the header on data-parallel rank 0
@@ -233,9 +233,6 @@ def data_parallel_train(rank, world_size, experiment, devices, epochs, skip_epoc
             throughputs.append(throughput)
             elapsed_times.append(elapsed_time)
 
-        if epoch < skip_epochs:
-            continue
-
     # RESULT ======================================================================================
     if rank == 0:
         hr()
@@ -267,12 +264,6 @@ def data_parallel_train(rank, world_size, experiment, devices, epochs, skip_epoc
     help='Number of epochs (default: 10)',
 )
 @click.option(
-    '--skip-epochs', '-k',
-    type=int,
-    default=1,
-    help='Number of epochs to skip in result (default: 1)',
-)
-@click.option(
     '--devices', '-d',
     metavar='0,1,2,3',
     callback=parse_devices,
@@ -282,14 +273,10 @@ def cli(ctx: click.Context,
         experiment: str,
         dp_world_size: int,
         epochs: int,
-        skip_epochs: int,
         devices: List[int],
         ) -> None:
     """ResNet-101 Speed Benchmark"""
-    if skip_epochs >= epochs:
-        ctx.fail('--skip-epochs=%d must be less than --epochs=%d' % (skip_epochs, epochs))
-
-    mp.spawn(data_parallel_train, args=(dp_world_size, experiment, devices, epochs, skip_epochs), 
+    mp.spawn(data_parallel_train, args=(dp_world_size, experiment, devices, epochs), 
             nprocs=dp_world_size, join=True)
 
 
