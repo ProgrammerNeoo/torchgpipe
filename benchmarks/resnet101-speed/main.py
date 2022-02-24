@@ -138,7 +138,7 @@ def data_parallel_train(rank, world_size, experiment, devices, epochs):
     except ValueError as exc:
         # Examples:
         #   ValueError: too few devices to hold given partitions (devices: 1, paritions: 2)
-        raise
+        raise exc
 
     # Data parallelism
     model = DDP(model)
