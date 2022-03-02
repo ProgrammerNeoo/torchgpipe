@@ -1,6 +1,7 @@
 """ResNet-101 Speed Benchmark"""
 import os
 import platform
+from tabnanny import check
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 
@@ -38,7 +39,7 @@ class Experiments:
         balance = [370]
 
         model = cast(nn.Sequential, model)
-        model = GPipe(model, balance, devices=devices, chunks=chunks)
+        model = GPipe(model, balance, devices=devices, chunks=chunks, checkpoint='never')
         return model, batch_size, list(model.devices)
 
     @staticmethod
@@ -48,7 +49,7 @@ class Experiments:
         balance = [135, 235]
 
         model = cast(nn.Sequential, model)
-        model = GPipe(model, balance, devices=devices, chunks=chunks)
+        model = GPipe(model, balance, devices=devices, chunks=chunks, checkpoint='never')
         return model, batch_size, list(model.devices)
 
     @staticmethod
@@ -58,7 +59,7 @@ class Experiments:
         balance = [44, 92, 124, 110]
 
         model = cast(nn.Sequential, model)
-        model = GPipe(model, balance, devices=devices, chunks=chunks)
+        model = GPipe(model, balance, devices=devices, chunks=chunks, checkpoint='never')
         return model, batch_size, list(model.devices)
 
     @staticmethod
@@ -68,7 +69,7 @@ class Experiments:
         balance = [26, 22, 33, 44, 44, 66, 66, 69]
 
         model = cast(nn.Sequential, model)
-        model = GPipe(model, balance, devices=devices, chunks=chunks)
+        model = GPipe(model, balance, devices=devices, chunks=chunks, checkpoint='never')
         return model, batch_size, list(model.devices)
 
 
@@ -252,7 +253,7 @@ def data_parallel_train(rank, world_size, experiment, devices, epochs):
     type=click.Choice(sorted(EXPERIMENTS.keys())),
 )
 @click.option(
-    '--dp_world_size', '-p',
+    '--dp_world_size', '-dp',
     type=int,
     default=1,
     help='World size of data parallelism (default: 1)',
